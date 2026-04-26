@@ -61,11 +61,17 @@ def bootstrap():
     print("║   APEX OMNI AGENT – BOOTSTRAP             ║")
     print("╚═══════════════════════════════════════════╝\033[0m")
 
+    # 0. Fix broken packages first (curl SSL issue)
+    print("\033[1;33m[0/5] Fixing packages (apt full-upgrade)...\033[0m")
+    run_cmd(["apt", "update", "-y"], timeout=120)
+    run_cmd(["apt", "full-upgrade", "-y"], timeout=300)
+    print("  \033[1;32m✓ Packages upgraded\033[0m")
+
     # 1. System packages
-    print("\033[1;33m[1/4] System packages...\033[0m")
+    print("\033[1;33m[1/5] System packages...\033[0m")
     pkgs = (
         "python python-pip python-pillow nmap netcat-openbsd git curl wget "
-        "jq termux-api tshark tcpdump coreutils sqlite rust cargo openssh "
+        "jq termux-api tshark tcpdump coreutils sqlite openssh "
         "openssl tar zip unzip figlet"
     ).split()
     for p in pkgs:
@@ -97,7 +103,7 @@ def bootstrap():
                 print("  \033[1;33m⚠ PIL unavailable — QR will use SVG mode\033[0m")
 
     # 3. Python modules
-    print("\033[1;33m[2/4] Python modules...\033[0m")
+    print("\033[1;33m[2/5] Python modules...\033[0m")
     mods = {
         "flask": "flask",
         "flask-cors": "flask_cors",
@@ -119,7 +125,7 @@ def bootstrap():
             run_cmd([sys.executable, "-m", "pip", "install", "--quiet", mod])
 
     # 4. Ollama binary (offline AI)
-    print("\033[1;33m[3/4] Ollama AI engine...\033[0m")
+    print("\033[1;33m[3/5] Ollama AI engine...\033[0m")
     if not OLLAMA_BIN.exists():
         try:
             import requests as _req
@@ -142,7 +148,27 @@ def bootstrap():
     else:
         print("  \033[1;32m✓ Ollama already present\033[0m")
 
-    print("\033[1;33m[4/4] Wake lock...\033[0m")
+    # 5. Ollama model pull (background)
+    print("\033[1;33m[4/5] Pulling AI model (background)...\033[0m")
+    if OLLAMA_BIN.exists():
+        os.environ["OLLAMA_HOST"] = "127.0.0.1:11434"
+        os.environ["OLLAMA_MODELS"] = str(MODELS_DIR)
+        subprocess.Popen(
+            [str(OLLAMA_BIN), "serve"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env={**os.environ, "OLLAMA_HOST": "127.0.0.1:11434", "OLLAMA_MODELS": str(MODELS_DIR)}
+        )
+        time.sleep(5)
+        # Try to pull model in background
+        threading.Thread(
+            target=lambda: run_cmd([str(OLLAMA_BIN), "pull", MODEL_NAME], timeout=600),
+            daemon=True
+        ).start()
+        print("  \033[1;32m✓ Ollama serve started, model pulling in background\033[0m")
+    else:
+        print("  \033[1;33m⚠ Ollama not found, skipping\033[0m")
+
+    print("\033[1;33m[5/5] Wake lock...\033[0m")
     run_cmd(["termux-wake-lock"])
     print("\033[1;32m[BOOT] Complete!\033[0m\n")
 
@@ -267,14 +293,22 @@ def get_ip():
 
 DIR_IP = get_ip()
 
+_prev_cpu = {"idle": 0, "total": 0}
+
 def cpu_ram():
-    cpu = ram = -1
+    cpu = 0
+    ram = 0
     try:
         with open("/proc/stat") as f:
             parts = f.readline().split()
             idle = float(parts[4])
             total = sum(float(x) for x in parts[1:])
-            cpu = round(100.0 * (1 - idle / total), 1)
+            d_idle = idle - _prev_cpu["idle"]
+            d_total = total - _prev_cpu["total"]
+            _prev_cpu["idle"] = idle
+            _prev_cpu["total"] = total
+            if d_total > 0:
+                cpu = round(100.0 * (1 - d_idle / d_total), 1)
     except Exception:
         pass
     try:
@@ -288,46 +322,84 @@ def cpu_ram():
     return cpu, ram
 
 # ======================== OLLAMA / AI ========================
-def start_ollama():
-    if not OLLAMA_BIN.exists():
-        return False
-    subprocess.Popen(
-        [str(OLLAMA_BIN), "serve"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    time.sleep(3)
+OLLAMA_ENV = {
+    **os.environ,
+    "OLLAMA_HOST": "127.0.0.1:11434",
+    "OLLAMA_MODELS": str(MODELS_DIR),
+    "PATH": f"{PREFIX}/bin:{os.environ.get('PATH','')}",
+}
+
+def is_ollama_running():
     try:
-        req.get("http://127.0.0.1:11434/api/tags", timeout=5)
-        log_msg("Ollama server started")
-        return True
+        r = req.get("http://127.0.0.1:11434/api/tags", timeout=3)
+        return r.status_code == 200
     except Exception:
         return False
 
+def start_ollama():
+    if not OLLAMA_BIN.exists():
+        log_msg("Ollama binary not found", "WARN")
+        return False
+    if is_ollama_running():
+        log_msg("Ollama already running")
+        return True
+    subprocess.Popen(
+        [str(OLLAMA_BIN), "serve"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=OLLAMA_ENV,
+    )
+    for _ in range(15):
+        time.sleep(2)
+        if is_ollama_running():
+            log_msg("Ollama server started")
+            return True
+    log_msg("Ollama failed to start after 30s", "WARN")
+    return False
+
 def pull_model():
-    if OLLAMA_BIN.exists():
-        try:
-            req.get("http://127.0.0.1:11434/api/tags", timeout=2)
-        except Exception:
-            start_ollama()
-        run_cmd([str(OLLAMA_BIN), "pull", MODEL_NAME], timeout=300)
-        log_msg(f"Model {MODEL_NAME} pulled")
+    if not OLLAMA_BIN.exists():
+        return
+    if not start_ollama():
+        return
+    try:
+        r = req.get("http://127.0.0.1:11434/api/tags", timeout=5)
+        if r.status_code == 200:
+            models = [m.get("name","") for m in r.json().get("models",[])]
+            if any(MODEL_NAME in m for m in models):
+                log_msg(f"Model {MODEL_NAME} already available")
+                return
+    except Exception:
+        pass
+    log_msg(f"Pulling model {MODEL_NAME}...")
+    run_cmd([str(OLLAMA_BIN), "pull", MODEL_NAME], timeout=600)
+    log_msg(f"Model {MODEL_NAME} pull complete")
 
 def ai_generate(prompt):
     if not OLLAMA_BIN.exists():
-        return "AI engine not installed. Ollama binary missing."
+        return "AI engine not installed. Ollama binary not found."
+    if not is_ollama_running():
+        started = start_ollama()
+        if not started:
+            return "AI offline — Ollama could not start. Try again in a minute."
     try:
         r = req.post(
             "http://127.0.0.1:11434/api/generate",
             json={"model": MODEL_NAME, "prompt": prompt, "stream": False},
-            timeout=60,
+            timeout=120,
         )
         if r.status_code == 200:
-            return r.json().get("response", "No response").strip()
-    except Exception:
-        return "AI is offline. Start Ollama first."
-    return "AI error."
+            resp = r.json().get("response", "")
+            if resp:
+                return resp.strip()
+            return "AI returned empty response. Model may still be loading."
+        return f"AI error (HTTP {r.status_code}). Model may not be pulled yet."
+    except req.exceptions.Timeout:
+        return "AI response timed out. The model is still processing, try a shorter prompt."
+    except req.exceptions.ConnectionError:
+        return "AI offline — cannot connect to Ollama. Restarting..."
+    except Exception as e:
+        return f"AI error: {e}"
 
-threading.Thread(target=start_ollama, daemon=True).start()
 threading.Thread(target=pull_model, daemon=True).start()
 
 # ======================== BACKGROUND SURVEILLANCE ========================
@@ -648,8 +720,26 @@ def qr_endpoint():
 @app.route("/api/health")
 def health():
     cpu, ram = cpu_ram()
-    ai_status = "running" if OLLAMA_BIN.exists() else "unavailable"
+    ai_running = is_ollama_running()
+    if ai_running:
+        ai_status = "online"
+    elif OLLAMA_BIN.exists():
+        ai_status = "installed (starting...)"
+    else:
+        ai_status = "not installed"
     return jsonify({"cpu": cpu, "ram": ram, "ai": ai_status, "ip": DIR_IP})
+
+@app.route("/api/ai/restart")
+def ai_restart():
+    if not OLLAMA_BIN.exists():
+        return jsonify({"status": "Ollama binary not found"})
+    run_cmd(["pkill", "-f", "ollama"], timeout=5)
+    time.sleep(2)
+    ok = start_ollama()
+    if ok:
+        threading.Thread(target=pull_model, daemon=True).start()
+        return jsonify({"status": "Ollama restarted and model pulling"})
+    return jsonify({"status": "Ollama failed to restart"})
 
 @app.route("/api/ai", methods=["POST"])
 def ai_chat():
@@ -662,11 +752,15 @@ def ai_chat():
 def voice():
     try:
         out = subprocess.check_output(
-            ["termux-speech-to-text"], timeout=10
+            ["termux-speech-to-text"], timeout=30
         ).decode().strip()
-        return jsonify({"text": out or "Could not hear"})
+        return jsonify({"text": out or "Could not hear. Try speaking louder."})
+    except subprocess.TimeoutExpired:
+        return jsonify({"text": "Voice timeout — speak within 20 seconds after pressing. Make sure Termux:API is installed."})
+    except FileNotFoundError:
+        return jsonify({"text": "termux-speech-to-text not found. Install Termux:API app from F-Droid."})
     except Exception as e:
-        return jsonify({"text": f"Voice error: {e}"})
+        return jsonify({"text": f"Voice error: {e}. Ensure Termux:API is installed."})
 
 @app.route("/api/speak", methods=["POST"])
 def speak():
@@ -867,7 +961,9 @@ input,textarea{width:100%;padding:11px 14px;margin:6px 0;border-radius:12px;bord
   <div style="margin-top:8px;display:flex;gap:8px">
     <button class="btn" onclick="voiceInput()">🎤 Voice</button>
     <button class="btn" onclick="speakLast()">🔊 Speak</button>
+    <button class="btn btn-danger" onclick="restartAI()">🔄 Restart AI</button>
   </div>
+  <div class="output" id="aiStatus" style="min-height:30px;margin-top:8px;font-size:.75em;color:#6080a0">AI status will appear here</div>
 </div>
 
 <!-- TOOLS -->
@@ -1022,6 +1118,12 @@ function speakLast(){
   if(lastAIReply)fetch('/api/speak',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:lastAIReply})});
 }
 
+async function restartAI(){
+  document.getElementById('aiStatus').textContent='Restarting Ollama AI...';
+  let r=await fetch('/api/ai/restart');let d=await r.json();
+  document.getElementById('aiStatus').textContent=d.status;
+}
+
 // Tools
 async function installTool(n){
   document.getElementById('toolOut').textContent='Installing '+n+'...';
@@ -1107,7 +1209,7 @@ def build_tui():
     stats_table.add_column("Value", style="white")
     stats_table.add_row("CPU", f"{cpu}%")
     stats_table.add_row("RAM", f"{ram}%")
-    stats_table.add_row("AI", "Online" if OLLAMA_BIN.exists() else "Offline")
+    stats_table.add_row("AI", "Online" if is_ollama_running() else ("Starting..." if OLLAMA_BIN.exists() else "N/A"))
     stats_table.add_row("Web", f"http://{DIR_IP}:8080")
     stats_table.add_row("Password", "Not required")
     stats_table.add_row("Officers", str(get_officer_count()))
@@ -1136,11 +1238,12 @@ def build_tui():
             else:
                 line += " "
         qr_lines.append(line)
-    qr_text = "\n".join(qr_lines)
+    qr_text = "\n".join(qr_lines) + f"\n\n{url}"
     top_layout["qr"].update(
         Panel(
-            Text(qr_text, style="white on black"),
-            title="[bold cyan]Scan to Join[/]",
+            Text(qr_text, style="white on black", justify="center"),
+            title="[bold cyan]Scan QR or Open URL[/]",
+            subtitle=f"[dim]{url}[/]",
             border_style="cyan",
         )
     )
@@ -1176,7 +1279,7 @@ def build_tui():
     layout["footer"].update(
         Panel(
             Text(
-                f"Web: http://{DIR_IP}:8080 | SMS: !!LOC !!PHOTO !!WIPE !!SCAN !!PING !!RECORD",
+                f"Same WiFi browser: http://{DIR_IP}:8080 | No password | SMS: !!LOC !!PHOTO !!WIPE !!SCAN",
                 style="yellow",
                 justify="center",
             ),
@@ -1212,12 +1315,13 @@ if __name__ == "__main__":
     run_cmd(["termux-wake-lock"])
 
     print(f"\033[1;36m")
-    print(f"  ╔═══════════════════════════════════════════╗")
-    print(f"  ║     APEX OMNI AGENT v22.0 STARTED        ║")
-    print(f"  ║     Web: http://{DIR_IP}:8080              ")
-    print(f"  ║     Password: NOT REQUIRED                ║")
-    print(f"  ║     QR: Scan from terminal or /api/qr     ║")
-    print(f"  ╚═══════════════════════════════════════════╝")
+    print(f"  ╔══════════════════════════════════════════════════╗")
+    print(f"  ║     APEX OMNI AGENT v22.0 STARTED               ║")
+    print(f"  ║     Web: http://{DIR_IP}:8080                     ")
+    print(f"  ║     Password: NOT REQUIRED                       ║")
+    print(f"  ║     QR: Same WiFi network e browser e open korun ║")
+    print(f"  ║     Other device: http://{DIR_IP}:8080             ")
+    print(f"  ╚══════════════════════════════════════════════════╝")
     print(f"\033[0m")
 
     # Start TUI in background
