@@ -71,21 +71,30 @@ def bootstrap():
     for p in pkgs:
         run_cmd(["pkg", "install", "-y", p])
 
-    # 2. Pillow (robust install)
+    # 2. Pillow (try multiple methods, but optional)
+    pil_ok = False
     try:
         from PIL import Image
+        pil_ok = True
         print("  \033[1;32m✓ PIL\033[0m")
     except ImportError:
         print("  \033[1;33m⏳ PIL installing via pkg...\033[0m")
         run_cmd(["pkg", "install", "-y", "python-pillow"])
         try:
             from PIL import Image
+            pil_ok = True
             print("  \033[1;32m✓ PIL via pkg\033[0m")
         except ImportError:
             print("  \033[1;33m⏳ PIL installing via pip...\033[0m")
             os.environ["LDFLAGS"] = "-L/system/lib/"
             os.environ["CFLAGS"] = f"-I{PREFIX}/include/"
             run_cmd([sys.executable, "-m", "pip", "install", "--quiet", "pillow"])
+            try:
+                from PIL import Image
+                pil_ok = True
+                print("  \033[1;32m✓ PIL via pip\033[0m")
+            except ImportError:
+                print("  \033[1;33m⚠ PIL unavailable — QR will use SVG mode\033[0m")
 
     # 3. Python modules
     print("\033[1;33m[2/4] Python modules...\033[0m")
@@ -144,10 +153,31 @@ from flask import Flask, request, jsonify, render_template_string, send_file, Re
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 import qrcode
-from PIL import Image
+try:
+    from PIL import Image
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 import requests as req
 import urllib3
 urllib3.disable_warnings()
+
+def make_qr_png_bytes(data):
+    """Generate QR code as PNG bytes. Falls back to SVG if PIL missing."""
+    if HAS_PIL:
+        img = qrcode.make(data)
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        buf.seek(0)
+        return buf.getvalue(), "image/png"
+    else:
+        import qrcode.image.svg
+        factory = qrcode.image.svg.SvgPathImage
+        img = qrcode.make(data, image_factory=factory)
+        buf = io.BytesIO()
+        img.save(buf)
+        buf.seek(0)
+        return buf.getvalue(), "image/svg+xml"
 
 from rich.console import Console
 from rich.layout import Layout
@@ -539,13 +569,10 @@ def deploy():
     conn.commit()
     conn.close()
     url = f"http://{DIR_IP}:8080/install?token={token}&cloud={cloud}"
-    img = qrcode.make(url)
-    buf = io.BytesIO()
-    img.save(buf, "PNG")
-    buf.seek(0)
+    qr_bytes, _ = make_qr_png_bytes(url)
     log_event("DEPLOY", DIR_IP, name)
     log_msg(f"Officer deployed: {name}")
-    return jsonify({"url": url, "qr": base64.b64encode(buf.getvalue()).decode()})
+    return jsonify({"url": url, "qr": base64.b64encode(qr_bytes).decode()})
 
 @app.route("/install")
 def install_officer():
@@ -615,11 +642,8 @@ def arp_table():
 
 @app.route("/api/qr")
 def qr_endpoint():
-    img = qrcode.make(f"http://{DIR_IP}:8080")
-    buf = io.BytesIO()
-    img.save(buf, "PNG")
-    buf.seek(0)
-    return Response(buf.getvalue(), mimetype="image/png")
+    qr_bytes, mime = make_qr_png_bytes(f"http://{DIR_IP}:8080")
+    return Response(qr_bytes, mimetype=mime)
 
 @app.route("/api/health")
 def health():
