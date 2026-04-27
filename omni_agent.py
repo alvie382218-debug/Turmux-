@@ -515,7 +515,7 @@ def silent_capture():
             except Exception:
                 pass
 
-            if GEOFENCE_FILE.exists():
+            if GEOFENCE_FILE.exists() and 'loc_out' in dir():
                 try:
                     geo = json.loads(GEOFENCE_FILE.read_text())
                     lat0, lon0 = geo.get("lat"), geo.get("lon")
